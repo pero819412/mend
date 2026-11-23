@@ -6,7 +6,7 @@
 // In a trial the grader runs `node /bot/main.ts` with MAKEFUN_ENV_URL set, and then this file hands over to runner.ts
 // (the last lines below): keep that hand-over and runner.ts as they are.
 
-import { mkdirSync, readFileSync, rmSync, statSync, writeFileSync, writeSync } from 'node:fs';
+import { mkdirSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync, writeSync } from 'node:fs';
 import { dirname } from 'node:path';
 
 const FORMATS = ['auto', 'unified', 'search-replace', 'v4a', 'json'];
@@ -168,6 +168,35 @@ class Tree {
   get(p: string): string | null {
     return this.now.has(p) ? this.now.get(p)! : this.original(p);
   }
+  /**
+   * Why the tree cannot hold a file at `p`: a proper ancestor that is a file, else `p` itself when some file still
+   * lies under `p/` (a change so far, or a file on disk the edits have not deleted); null when nothing blocks it.
+   * `gone` is a path to count as already vacated (a move's source).
+   */
+  blocker(p: string, gone: string | null = null): string | null {
+    const has = (q: string): boolean => q !== gone && this.get(q) !== null;
+    const parts = p.split('/');
+    for (let k = 1; k < parts.length; k += 1) {
+      const q = parts.slice(0, k).join('/');
+      if (has(q)) return q;
+    }
+    const under = `${p}/`;
+    for (const [q, v] of this.now) if (v !== null && q !== gone && q.startsWith(under)) return p;
+    let names: string[] = [];
+    try {
+      if (statSync(p).isDirectory()) names = readdirSync(p, { recursive: true, encoding: 'utf8' });
+    } catch {
+      names = [];
+    }
+    for (const n of names) if (has(under + n)) return p;
+    return null;
+  }
+  /** Fails with `exists` unless the tree can take a file at `p` (counting `gone` as vacated). */
+  place(p: string, gone: string | null = null): void {
+    if (this.get(p) !== null) throw new Fail('exists', p);
+    const b = this.blocker(p, gone);
+    if (b !== null) throw new Fail('exists', b);
+  }
 }
 
 interface Ctx {
@@ -319,7 +348,7 @@ function sectionEdit(s: Section): Edit {
   return (tree, ctx) => {
     if (creation) {
       checkSafe(newP);
-      if (tree.get(newP) !== null) throw new Fail('exists', newP);
+      tree.place(newP);
       const plus: string[] = [];
       let final = true;
       for (const h of s.hunks) {
@@ -343,7 +372,7 @@ function sectionEdit(s: Section): Edit {
     if (move) checkSafe(newP);
     const text = tree.get(oldP);
     if (text === null) throw new Fail('missing', oldP);
-    if (move && tree.get(newP) !== null) throw new Fail('exists', newP);
+    if (move) tree.place(newP, oldP);
     const f = toLines(text);
     let d = 0;
     for (const h of s.hunks) {
@@ -436,7 +465,7 @@ function blockEdit(p: string, oldLines: string[], newLines: string[]): Edit {
     checkSafe(p);
     const text = tree.get(p);
     if (oldLines.length === 0) {
-      if (text !== null) throw new Fail('exists', p);
+      tree.place(p);
       tree.now.set(p, newFile(newLines));
       return;
     }
@@ -546,7 +575,7 @@ function v4aEdits(lines: string[]): Edit[] {
 function addEdit(p: string, out: string[]): Edit {
   return (tree) => {
     checkSafe(p);
-    if (tree.get(p) !== null) throw new Fail('exists', p);
+    tree.place(p);
     tree.now.set(p, newFile(out));
   };
 }
@@ -565,7 +594,7 @@ function updateEdit(p: string, move: string | null, chunks: Chunk[]): Edit {
     if (move !== null) checkSafe(move);
     const text = tree.get(p);
     if (text === null) throw new Fail('missing', p);
-    if (move !== null && tree.get(move) !== null) throw new Fail('exists', move);
+    if (move !== null) tree.place(move, p);
     const f = toLines(text);
     let cursor = 0;
     for (const c of chunks) {
@@ -617,7 +646,7 @@ function jsonEdit(v: unknown): Edit | null {
     const text = o.file_text;
     return (tree) => {
       checkSafe(p);
-      if (tree.get(p) !== null) throw new Fail('exists', p);
+      tree.place(p);
       tree.now.set(p, text);
     };
   }
@@ -769,6 +798,14 @@ function run(args: string[]): { code: number; out: string[] } {
       const now = tree.now.get(p)!;
       if (now === null || now === tree.original(p)) continue;
       mkdirSync(dirname(p), { recursive: true });
+      // A directory left at p holds only empty directories now (the edits deleted every file under it): clear it.
+      let dir = false;
+      try {
+        dir = statSync(p).isDirectory();
+      } catch {
+        dir = false;
+      }
+      if (dir) rmSync(p, { recursive: true, force: true });
       writeFileSync(p, now);
     }
   }
